@@ -30,9 +30,46 @@ async function callClaude(messages, maxTokens = 2000) {
 }
 
 function extractJSON(text) {
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) throw new Error('JSON not found');
-  return JSON.parse(match[0]);
+  // Remove markdown code blocks if present
+  text = text.replace(/```json|```/g, '').trim();
+  
+  // Find the outermost JSON object
+  const start = text.indexOf('{');
+  if (start === -1) throw new Error('JSON not found');
+  
+  // Find matching closing brace
+  let depth = 0;
+  let end = -1;
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === '{') depth++;
+    else if (text[i] === '}') {
+      depth--;
+      if (depth === 0) { end = i; break; }
+    }
+  }
+  
+  if (end === -1) throw new Error('Malformed JSON');
+  
+  let jsonStr = text.slice(start, end + 1);
+  
+  // Fix common JSON issues
+  // Remove trailing commas before } or ]
+  jsonStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
+  // Fix unescaped newlines in strings
+  jsonStr = jsonStr.replace(/([^\\])\n/g, '$1\\n');
+  
+  try {
+    return JSON.parse(jsonStr);
+  } catch(e) {
+    // Last resort: try to extract just the products array
+    const arrMatch = jsonStr.match(/"products"\s*:\s*\[[\s\S]*\]/);
+    if (arrMatch) {
+      try {
+        return JSON.parse('{"products":' + arrMatch[0].replace(/^"products"\s*:\s*/, '') + '}');
+      } catch(e2) {}
+    }
+    throw new Error('JSON parse failed: ' + e.message);
+  }
 }
 
 // ─── ROUTE: Generate Copy ────────────────────────────────────────────────────
@@ -113,7 +150,7 @@ Return ONLY raw JSON:
   ]
 }`;
 
-    const raw = await callClaude([{ role: 'user', content: [{ type: 'text', text: prompt }] }], 2500);
+    const raw = await callClaude([{ role: 'user', content: [{ type: 'text', text: prompt }] }], 4000);
     const result = extractJSON(raw);
     res.json({ success: true, data: result });
   } catch (err) {
