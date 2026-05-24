@@ -30,7 +30,7 @@ async function callClaude(messages, maxTokens = 1500) {
       'anthropic-version': '2023-06-01'
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'claude-sonnet-4-6',
       max_tokens: maxTokens,
       messages
     })
