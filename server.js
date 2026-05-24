@@ -11,10 +11,9 @@ const API_KEY = process.env.ANTHROPIC_API_KEY;
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
-
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-async function callClaude(messages, maxTokens = 2000) {
+async function callClaude(prompt, maxTokens = 1500) {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -22,86 +21,34 @@ async function callClaude(messages, maxTokens = 2000) {
       'x-api-key': API_KEY,
       'anthropic-version': '2023-06-01'
     },
-    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: maxTokens, system: 'You are a JSON API. Always respond with valid JSON only. No markdown, no backticks, no text before or after. Start with { and end with }.', messages })
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: maxTokens,
+      system: 'You are a JSON API. Respond ONLY with valid JSON. No markdown, no backticks, no extra text.',
+      messages: [{ role: 'user', content: prompt }]
+    })
   });
   const data = await response.json();
   if (data.error) throw new Error(data.error.message);
-  return data.content.filter(b => b.type === 'text').map(b => b.text).join('');
-}
-
-function extractJSON(text) {
-  // Remove markdown code blocks if present
-  text = text.replace(/```json|```/g, '').trim();
-  
-  // Find the outermost JSON object
-  const start = text.indexOf('{');
-  if (start === -1) throw new Error('JSON not found');
-  
-  // Find matching closing brace
-  let depth = 0;
-  let end = -1;
-  for (let i = start; i < text.length; i++) {
-    if (text[i] === '{') depth++;
-    else if (text[i] === '}') {
-      depth--;
-      if (depth === 0) { end = i; break; }
-    }
-  }
-  
-  if (end === -1) throw new Error('Malformed JSON');
-  
-  let jsonStr = text.slice(start, end + 1);
-  
-  // Fix common JSON issues
-  // Remove trailing commas before } or ]
-  jsonStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
-  // Fix unescaped newlines in strings
-  jsonStr = jsonStr.replace(/([^\\])\n/g, '$1\\n');
-  
-  try {
-    return JSON.parse(jsonStr);
-  } catch(e) {
-    // Last resort: try to extract just the products array
-    const arrMatch = jsonStr.match(/"products"\s*:\s*\[[\s\S]*\]/);
-    if (arrMatch) {
-      try {
-        return JSON.parse('{"products":' + arrMatch[0].replace(/^"products"\s*:\s*/, '') + '}');
-      } catch(e2) {}
-    }
-    throw new Error('JSON parse failed: ' + e.message);
-  }
+  const text = data.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+  // Clean and parse
+  const clean = text.replace(/```json|```/g, '').replace(/,\s*([}\]])/g, '$1').trim();
+  const start = clean.indexOf('{');
+  const end = clean.lastIndexOf('}');
+  if (start === -1 || end === -1) throw new Error('No JSON in response');
+  return JSON.parse(clean.slice(start, end + 1));
 }
 
 // ─── ROUTE: Generate Copy ────────────────────────────────────────────────────
 app.post('/gerar-copy', upload.single('imagem'), async (req, res) => {
   try {
     const { nome_produto, mercado = 'Netherlands' } = req.body;
-    const content = [];
+    if (!nome_produto) return res.status(400).json({ success: false, error: 'nome_produto is required' });
 
-    if (req.file) {
-      content.push({ type: 'image', source: { type: 'base64', media_type: req.file.mimetype, data: req.file.buffer.toString('base64') } });
-    }
-
-    content.push({
-      type: 'text',
-      text: `You are a luxury e-commerce copywriter for a dropshipping store targeting ${mercado}.
-Product: ${nome_produto || 'shown in image'}
-
-Return ONLY raw JSON:
-{
-  "productName": "elegant product name in English",
-  "shopifyTitle": "concise Shopify title",
-  "shopifyDescription": "3 paragraphs, refined aspirational tone, no bullet points",
-  "instagramCaption": "caption max 100 words, aspirational, no hashtags",
-  "hashtags": "15 relevant hashtags",
-  "suggestedPrice": "suggested retail price in EUR",
-  "targetAudience": "who buys this",
-  "adAngle": "best angle to advertise this product"
-}`
-    });
-
-    const raw = await callClaude([{ role: 'user', content }]);
-    const result = extractJSON(raw);
+    const result = await callClaude(
+      `Luxury e-commerce copywriter for dropshipping store targeting ${mercado}. Product: "${nome_produto}".
+Return JSON: {"productName":"string","shopifyTitle":"string","shopifyDescription":"3 paragraphs no bullets","instagramCaption":"max 80 words no hashtags","hashtags":"12 hashtags","suggestedPrice":"EUR price","targetAudience":"string","adAngle":"string"}`
+    );
     res.json({ success: true, data: result });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -114,52 +61,42 @@ app.post('/minerar', async (req, res) => {
     const { nicho, mercado = 'Netherlands', preco_max = 10 } = req.body;
     if (!nicho) return res.status(400).json({ success: false, error: 'nicho is required' });
 
-    const prompt = `You are an expert dropshipping product researcher for the ${mercado} market.
+    // Step 1: Get 5 products (simple, no competitors yet)
+    const productsResult = await callClaude(
+      `Dropshipping researcher for ${mercado}. Find 5 winning products in "${nicho}" niche under $${preco_max} on AliExpress.
+Return JSON: {"products":[{"name":"string","estimatedCostUSD":"$X-$Y","suggestedPriceEUR":"€X-€Y","estimatedMargin":"X%-Y%","whyItWins":"string","targetCustomer":"string","bestAdChannel":"string","adHook":"string","aliexpressSearch":"search keywords"}]}`,
+      2000
+    );
 
-Find 5 winning products in the "${nicho}" niche under $${preco_max} on AliExpress.
+    // Step 2: For each product, build AliExpress URL and get one competitor
+    const products = productsResult.products || [];
+    const enriched = await Promise.all(products.map(async (p) => {
+      // Build AliExpress URL from search terms
+      const searchSlug = (p.aliexpressSearch || p.name).toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '-');
+      p.aliexpressUrl = `https://www.aliexpress.com/w/wholesale-${searchSlug}.html`;
 
-For each product, generate a REAL AliExpress search URL in this format:
-https://www.aliexpress.com/w/wholesale-[search-terms-with-hyphens].html
+      // Get competitor for this product
+      try {
+        const compResult = await callClaude(
+          `Find 2 real online stores in ${mercado} selling "${p.name}". Include bol.com or local webshops.
+Return JSON: {"competitors":[{"name":"store name","url":"https://...","price":"€XX","weakness":"main weakness to exploit"}]}`,
+          600
+        );
+        p.competitors = compResult.competitors || [];
+      } catch(e) {
+        p.competitors = [];
+      }
+      return p;
+    }));
 
-Also research real competitors in ${mercado} — actual Dutch/local webshops or marketplaces (bol.com, coolblue, local Shopify stores) that sell similar products. Include their approximate pricing and weaknesses.
-
-Return ONLY raw JSON:
-{
-  "products": [
-    {
-      "name": "product name",
-      "description": "what it is and why it sells",
-      "aliexpressUrl": "https://www.aliexpress.com/w/wholesale-[terms].html",
-      "aliexpressSearch": "search terms to use on AliExpress",
-      "estimatedCostUSD": "$X - $Y",
-      "suggestedPriceEUR": "€X - €Y",
-      "estimatedMargin": "X% - Y%",
-      "whyItWins": "why this product wins in ${mercado}",
-      "targetCustomer": "who buys this",
-      "bestAdChannel": "Instagram / TikTok / Google / Facebook",
-      "adHook": "best ad hook to sell this product",
-      "competitors": [
-        {
-          "name": "competitor store or marketplace name",
-          "url": "their website URL",
-          "price": "their price in EUR",
-          "weakness": "their main weakness you can exploit"
-        }
-      ]
-    }
-  ]
-}`;
-
-    const raw = await callClaude([{ role: 'user', content: [{ type: 'text', text: prompt }] }], 4000);
-    const result = extractJSON(raw);
-    res.json({ success: true, data: result });
+    res.json({ success: true, data: { products: enriched } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', apiKey: API_KEY ? 'configured' : 'MISSING' });
+  res.json({ status: 'ok', apiKey: API_KEY ? 'OK' : 'MISSING' });
 });
 
 // ─── FRONTEND ────────────────────────────────────────────────────────────────
@@ -174,7 +111,7 @@ app.get('/', (req, res) => {
   @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&family=Montserrat:wght@300;400;500;600&display=swap');
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#F5F2EE;font-family:'Montserrat',sans-serif;color:#2C2825;min-height:100vh}
-  header{background:#1A1A1A;padding:16px 24px;display:flex;justify-content:space-between;align-items:center}
+  header{background:#1A1A1A;padding:16px 24px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
   .logo{font-family:'Cormorant Garamond',serif;font-size:24px;color:#fff;font-style:italic}
   .logo-sub{font-size:9px;color:#B8985A;letter-spacing:.2em;text-transform:uppercase;margin-top:2px}
   .tabs{display:flex;gap:8px}
@@ -210,12 +147,11 @@ app.get('/', (req, res) => {
   .competitor{background:#F5F2EE;border-radius:3px;padding:10px 12px;margin-bottom:8px}
   .competitor-name{font-size:12px;font-weight:600;color:#1A1A1A;margin-bottom:2px}
   .competitor-url{font-size:10px;color:#B8985A;text-decoration:none;display:block;margin-bottom:4px}
-  .competitor-url:hover{text-decoration:underline}
-  .competitor-detail{font-size:11px;color:#8A8580;line-height:1.6}
   .competitor-weakness{display:inline-block;background:#fff;border:1px solid #E8E2DA;border-radius:2px;padding:2px 8px;font-size:10px;color:#C0392B;margin-top:4px}
   .error{background:#fdf2f2;border:1px solid #f5c6c6;border-radius:3px;padding:11px 14px;color:#C0392B;font-size:11px;margin-top:10px}
   .loading{text-align:center;padding:40px;color:#8A8580;font-style:italic;font-family:'Cormorant Garamond',serif;font-size:18px}
   .spinner{width:28px;height:28px;border:2px solid #E8E2DA;border-top:2px solid #B8985A;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 14px}
+  .loading-sub{font-size:11px;font-family:'Montserrat',sans-serif;font-style:normal;margin-top:8px;color:#B8985A}
   @keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
@@ -226,13 +162,11 @@ app.get('/', (req, res) => {
     <div class="logo-sub">Product Intelligence</div>
   </div>
   <div class="tabs">
-    <button class="tab active" onclick="switchTab('copy', this)">Gerar Copy</button>
-    <button class="tab" onclick="switchTab('minerar', this)">Minerar Produtos</button>
+    <button class="tab active" onclick="switchTab('copy',this)">Gerar Copy</button>
+    <button class="tab" onclick="switchTab('minerar',this)">Minerar Produtos</button>
   </div>
 </header>
-
 <main>
-  <!-- COPY PANEL -->
   <div class="panel active" id="panel-copy">
     <div class="card">
       <div class="card-title">Gerar Copy de Produto</div>
@@ -252,11 +186,10 @@ app.get('/', (req, res) => {
     <div id="copyResult"></div>
   </div>
 
-  <!-- MINERAR PANEL -->
   <div class="panel" id="panel-minerar">
     <div class="card">
       <div class="card-title">Minerar Produtos Vencedores</div>
-      <div class="card-sub">Nicho → 5 produtos com link AliExpress, preço, margem e análise de concorrentes locais.</div>
+      <div class="card-sub">Nicho → 5 produtos com link AliExpress, preço, margem e concorrentes locais. Demora ~30 segundos.</div>
       <label>Nicho</label>
       <input type="text" id="nicho" placeholder="ex: casa e jardim minimalista, pet accessories...">
       <div class="row">
@@ -288,23 +221,15 @@ function switchTab(tab, el) {
   el.classList.add('active');
   document.getElementById('panel-' + tab).classList.add('active');
 }
-
 function copyText(text, btn) {
   navigator.clipboard.writeText(text);
   btn.textContent = '✓ Copiado';
   setTimeout(() => btn.textContent = 'Copiar', 2000);
 }
-
 function resultCard(label, content) {
-  return \`<div class="result-card">
-    <div class="result-header">
-      <span class="result-label">\${label}</span>
-      <button class="copy-btn" onclick="copyText(\\\`\${content.replace(/\`/g,'')}\\\`, this)">Copiar</button>
-    </div>
-    <div class="result-body">\${content}</div>
-  </div>\`;
+  const safe = (content||'').replace(/\`/g,"'");
+  return '<div class="result-card"><div class="result-header"><span class="result-label">'+label+'</span><button class="copy-btn" onclick="copyText(this.dataset.text,this)" data-text="'+safe.replace(/"/g,'&quot;')+'">Copiar</button></div><div class="result-body">'+safe+'</div></div>';
 }
-
 async function gerarCopy() {
   const nome = document.getElementById('nomeProduto').value.trim();
   const mercado = document.getElementById('mercadoCopy').value;
@@ -323,24 +248,22 @@ async function gerarCopy() {
     const json = await res.json();
     if (!json.success) throw new Error(json.error);
     const d = json.data;
-    resultDiv.innerHTML = \`
-      <div class="result-card" style="padding:14px;background:#fff;border:1px solid #E8E2DA;border-radius:4px;margin-bottom:12px">
-        <span style="font-size:10px;color:#B8985A;text-transform:uppercase;letter-spacing:.1em;font-weight:600">\${d.targetAudience || ''}</span>
-        <span style="font-size:12px;font-weight:700;color:#4A7C59;margin-left:12px">\${d.suggestedPrice || ''}</span>
-      </div>
-      \${resultCard('Título Shopify', d.shopifyTitle || '')}
-      \${resultCard('Descrição Shopify', d.shopifyDescription || '')}
-      \${resultCard('Caption Instagram', d.instagramCaption || '')}
-      \${resultCard('Hashtags', d.hashtags || '')}
-      \${resultCard('Ângulo de Anúncio', d.adAngle || '')}\`;
+    resultDiv.innerHTML =
+      '<div style="padding:12px 14px;background:#fff;border:1px solid #E8E2DA;border-radius:4px;margin-bottom:12px;display:flex;justify-content:space-between">' +
+      '<span style="font-size:11px;color:#8A8580">' + (d.targetAudience||'') + '</span>' +
+      '<span style="font-size:13px;font-weight:700;color:#4A7C59">' + (d.suggestedPrice||'') + '</span></div>' +
+      resultCard('Título Shopify', d.shopifyTitle) +
+      resultCard('Descrição Shopify', d.shopifyDescription) +
+      resultCard('Caption Instagram', d.instagramCaption) +
+      resultCard('Hashtags', d.hashtags) +
+      resultCard('Ângulo de Anúncio', d.adAngle);
   } catch (err) {
-    errorDiv.innerHTML = \`<div class="error">Erro: \${err.message}</div>\`;
+    errorDiv.innerHTML = '<div class="error">Erro: ' + err.message + '</div>';
     resultDiv.innerHTML = '';
   } finally {
     btn.disabled = false; btn.textContent = 'Gerar Copy →';
   }
 }
-
 async function minerarProdutos() {
   const nicho = document.getElementById('nicho').value.trim();
   const mercado = document.getElementById('mercadoMinerar').value;
@@ -351,7 +274,7 @@ async function minerarProdutos() {
   if (!nicho) { errorDiv.innerHTML = '<div class="error">Digite o nicho.</div>'; return; }
   btn.disabled = true; btn.textContent = 'A minerar...';
   errorDiv.innerHTML = '';
-  resultDiv.innerHTML = '<div class="loading"><div class="spinner"></div>A garimpar produtos e analisar concorrentes...</div>';
+  resultDiv.innerHTML = '<div class="loading"><div class="spinner"></div>A garimpar produtos e concorrentes...<div class="loading-sub">Isto demora ~30 segundos</div></div>';
   try {
     const res = await fetch('/minerar', {
       method: 'POST',
@@ -361,34 +284,36 @@ async function minerarProdutos() {
     const json = await res.json();
     if (!json.success) throw new Error(json.error);
     const products = json.data.products || [];
-    resultDiv.innerHTML = products.map((p, i) => \`
-      <div class="product-card">
-        <div class="product-num">Produto \${i+1}</div>
-        <div class="product-name">\${p.name}</div>
-        <div class="product-meta">
-          <div class="meta-item"><div class="meta-value">\${p.estimatedCostUSD||'-'}</div><div class="meta-label">Custo Ali</div></div>
-          <div class="meta-item"><div class="meta-value">\${p.suggestedPriceEUR||'-'}</div><div class="meta-label">Preço Venda</div></div>
-          <div class="meta-item"><div class="meta-value" style="color:#4A7C59">\${p.estimatedMargin||'-'}</div><div class="meta-label">Margem</div></div>
-        </div>
-        <div class="product-detail">
-          <strong>Por que vende:</strong> \${p.whyItWins||''}<br>
-          <strong>Cliente:</strong> \${p.targetCustomer||''}<br>
-          <strong>Melhor canal:</strong> \${p.bestAdChannel||''}<br>
-          <strong>Hook:</strong> \${p.adHook||''}
-        </div>
-        <a class="ali-link" href="\${p.aliexpressUrl}" target="_blank">🛒 Ver no AliExpress</a>
-        \${p.competitors && p.competitors.length > 0 ? \`
-        <div class="competitors-title">🏪 Concorrentes Locais</div>
-        \${p.competitors.map(c => \`
-          <div class="competitor">
-            <div class="competitor-name">\${c.name}</div>
-            <a class="competitor-url" href="\${c.url}" target="_blank">\${c.url}</a>
-            <div class="competitor-detail"><strong>Preço deles:</strong> \${c.price}</div>
-            <span class="competitor-weakness">⚠ \${c.weakness}</span>
-          </div>\`).join('')}\` : ''}
-      </div>\`).join('');
+    resultDiv.innerHTML = products.map((p, i) =>
+      '<div class="product-card">' +
+      '<div class="product-num">Produto ' + (i+1) + '</div>' +
+      '<div class="product-name">' + p.name + '</div>' +
+      '<div class="product-meta">' +
+        '<div class="meta-item"><div class="meta-value">' + (p.estimatedCostUSD||'-') + '</div><div class="meta-label">Custo Ali</div></div>' +
+        '<div class="meta-item"><div class="meta-value">' + (p.suggestedPriceEUR||'-') + '</div><div class="meta-label">Preço Venda</div></div>' +
+        '<div class="meta-item"><div class="meta-value" style="color:#4A7C59">' + (p.estimatedMargin||'-') + '</div><div class="meta-label">Margem</div></div>' +
+      '</div>' +
+      '<div class="product-detail">' +
+        '<strong>Por que vende:</strong> ' + (p.whyItWins||'') + '<br>' +
+        '<strong>Cliente:</strong> ' + (p.targetCustomer||'') + '<br>' +
+        '<strong>Canal:</strong> ' + (p.bestAdChannel||'') + '<br>' +
+        '<strong>Hook:</strong> ' + (p.adHook||'') +
+      '</div>' +
+      '<a class="ali-link" href="' + p.aliexpressUrl + '" target="_blank">🛒 Ver no AliExpress</a>' +
+      (p.competitors && p.competitors.length > 0 ?
+        '<div class="competitors-title">🏪 Concorrentes Locais</div>' +
+        p.competitors.map(c =>
+          '<div class="competitor">' +
+          '<div class="competitor-name">' + c.name + '</div>' +
+          '<a class="competitor-url" href="' + c.url + '" target="_blank">' + c.url + '</a>' +
+          '<div style="font-size:11px;color:#2C2825;margin-bottom:4px"><strong>Preço deles:</strong> ' + c.price + '</div>' +
+          '<span class="competitor-weakness">⚠ ' + c.weakness + '</span>' +
+          '</div>'
+        ).join('') : '') +
+      '</div>'
+    ).join('');
   } catch (err) {
-    errorDiv.innerHTML = \`<div class="error">Erro: \${err.message}</div>\`;
+    errorDiv.innerHTML = '<div class="error">Erro: ' + err.message + '</div>';
     resultDiv.innerHTML = '';
   } finally {
     btn.disabled = false; btn.textContent = 'Minerar Produtos →';
@@ -400,6 +325,6 @@ async function minerarProdutos() {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Zellaro Intelligence running on port ${PORT}`);
-  console.log(`🔑 API Key: ${API_KEY ? 'OK' : 'MISSING'}`);
+  console.log('✅ Zellaro Intelligence running on port ' + PORT);
+  console.log('🔑 API Key: ' + (API_KEY ? 'OK' : 'MISSING'));
 });
