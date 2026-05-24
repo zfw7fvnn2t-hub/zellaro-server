@@ -22,7 +22,7 @@ async function callClaude(messages, maxTokens = 2000) {
       'x-api-key': API_KEY,
       'anthropic-version': '2023-06-01'
     },
-    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: maxTokens, messages })
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: maxTokens, system: 'You are a JSON API. Always respond with valid JSON only. No markdown, no backticks, no text before or after. Start with { and end with }.', messages })
   });
   const data = await response.json();
   if (data.error) throw new Error(data.error.message);
